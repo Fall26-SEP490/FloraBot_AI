@@ -1,0 +1,11 @@
+name: Advisor verification
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  advisor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target test -t florabot-ai-tests .
