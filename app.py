@@ -15,6 +15,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from seasonal import (
+    SeasonalForecastRequest,
+    SeasonalForecastResponse,
+    calculate_forecast_statistics,
+    enrich_with_gemini_explanations,
+    get_current_vietnam_calendar_context,
+)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -22,6 +30,7 @@ class Settings:
     api_key: str = ""
     model: str = ""
     deadline_seconds: float = 1.7
+    seller_deadline_seconds: float = 8.0
 
     @classmethod
     def from_env(cls):
@@ -29,6 +38,8 @@ class Settings:
             service_token=os.getenv("AI_SERVICE_TOKEN", ""),
             api_key=os.getenv("GEMINI_API_KEY", ""),
             model=os.getenv("GEMINI_MODEL", ""),
+            deadline_seconds=float(os.getenv("ADVISOR_DEADLINE_SECONDS", "1.7")),
+            seller_deadline_seconds=float(os.getenv("SELLER_DEADLINE_SECONDS", "8.0")),
         )
 
     @property
@@ -139,6 +150,11 @@ RESPONSE_SCHEMA = {
 }
 
 
+def get_suggest_system_prompt() -> str:
+    context = get_current_vietnam_calendar_context()
+    return f"{SYSTEM_PROMPT} {context}"
+
+
 async def advise(
     payload: SuggestRequest, settings: Settings, client: httpx.AsyncClient
 ):
@@ -153,7 +169,7 @@ async def advise(
             item[key] = clean_text(item[key])
         item["tags"] = [clean_text(tag) for tag in item["tags"]]
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "systemInstruction": {"parts": [{"text": get_suggest_system_prompt()}]},
         "contents": [
             {"role": "user", "parts": [{"text": json.dumps(data, ensure_ascii=False)}]}
         ],
@@ -213,19 +229,59 @@ async def advise(
 
 
 class BodyLimit:
-    def __init__(self, app):
+    def __init__(self, app, settings: Settings | None = None):
         self.app = app
+        self.settings = settings or Settings.from_env()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        clean_path = path.rstrip("/")
+        if clean_path in ("/suggest", "/seasonal/forecast"):
+            if len(self.settings.service_token) < 32:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 503,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail":"Advisor is not configured."}',
+                    }
+                )
+                return
+
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode("latin1")
+            expected = "Bearer " + self.settings.service_token
+            if not hmac.compare_digest(auth_header.encode(), expected.encode()):
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail":"Service authentication required."}',
+                    }
+                )
+                return
+
+        max_limit = 16 * 1024 * 1024 if path.startswith("/seasonal") else 65536
         body = bytearray()
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
                 return
             body.extend(message.get("body", b""))
-            if len(body) > 65536:
+            if len(body) > max_limit:
                 await send(
                     {"type": "http.response.start", "status": 413, "headers": []}
                 )
@@ -246,19 +302,22 @@ class BodyLimit:
         await self.app(scope, replay, send)
 
 
+FORECAST_CONCURRENCY = asyncio.Semaphore(2)
+
+
 def create_app(settings: Settings | None = None, transport=None):
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app):
         async with httpx.AsyncClient(
-            timeout=1.5, follow_redirects=False, transport=transport
+            timeout=12.0, follow_redirects=False, transport=transport
         ) as client:
             app.state.client = client
             yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(BodyLimit)
+    app.add_middleware(BodyLimit, settings=settings)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, error: RequestValidationError):
@@ -284,6 +343,20 @@ def create_app(settings: Settings | None = None, transport=None):
         if not settings.configured:
             raise HTTPException(503, "Advisor is not configured; use backend fallback.")
         return await advise(payload, settings, request.app.state.client)
+
+    @app.post(
+        "/seasonal/forecast",
+        response_model=SeasonalForecastResponse,
+        dependencies=[Depends(authenticate)],
+    )
+    async def seasonal_forecast(payload: SeasonalForecastRequest, request: Request):
+        async with FORECAST_CONCURRENCY:
+            response = await asyncio.to_thread(calculate_forecast_statistics, payload)
+            if payload.include_explanations and settings.configured:
+                await enrich_with_gemini_explanations(
+                    response, settings, request.app.state.client
+                )
+            return response
 
     return app
 

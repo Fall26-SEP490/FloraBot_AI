@@ -59,3 +59,63 @@ no customer or session identifier. Set the same GEMINI_MODEL on API and service;
 increment AI_CACHE_VERSION when changing prompt/ranking semantics. Missing model
 configuration disables caching. Cache availability is optional for suggestions.
 Live provider behavior and the complete end-to-end latency target remain unverified.
+
+## Seasonal Sales Forecast (seasonal-v1)
+
+Internal seller planning endpoint `POST /seasonal/forecast` provides deterministic demand frequency
+forecasting using Poisson count regression and calendar statistics.
+
+### Contract & Configuration
+
+- `POST /seasonal/forecast` requires `Authorization: Bearer <AI_SERVICE_TOKEN>`.
+- Request body follows frozen `seasonal-v1` contract: `history_start`, `history_end`, `target_year`,
+  `target_month`, `data_source` (`DATABASE` or `SYNTHETIC`), `products` (max 100), and `observations` (max 110,000).
+- Strict bounds: target month must strictly follow `history_end` (`history_end < forecast_start`), maximum
+  history coverage 1096 days, maximum gap 366 days, non-negative integer counts (`invoice_count <= units`).
+  Observations preceding `product.available_since` are strictly rejected with 422.
+- Request body size limit: bounded up to 16MB for seasonal forecasts, 64KB for `/suggest`.
+- Provider configuration: optional `GEMINI_API_KEY` and `GEMINI_MODEL`. Total client budget is 12s;
+  Gemini explanation requests are bounded to at most 8s. If unconfigured, quota-limited, timed out,
+  or provider returns invalid/safety-blocked output, deterministic fallback explanations are used
+  (`explanation_source: "FALLBACK"`). Numerical rankings and forecasts are never altered by Gemini.
+
+### Methodology & Modeling
+
+- **Calendar & Proximity**: Asia/Ho_Chi_Minh dates. 4 seasons (SPRING: Mar-May, SUMMER: Jun-Aug, AUTUMN: Sep-Nov,
+  WINTER: Dec-Feb). Gregorian flower holidays (Jan 1, Feb 14, Mar 8, Oct 20, Nov 20, Dec 25) with 8-day
+  active windows (7 preceding days + event day).
+- **Poisson Count Regression**: `scikit-learn==1.9.1` `PoissonRegressor` with L2 regularization and cyclic
+  calendar features (weekday one-hot, month sin/cos, day-of-year sin/cos, holiday window flags).
+  If fitting or numerical convergence fails, the model safely falls back to `WEEKDAY_BASELINE` with an explicit warning.
+- **Coverage & Zero-filling**: Zero-fill is strictly limited to declared covered days
+  (`max(history_start, product.available_since)` to `history_end`). Observations before `available_since` are rejected.
+- **Truthful Null Forecasts**: Products with < 70 covered days (< 56 train + 14 holdout) or < 10 positive invoice
+  observation days receive `INSUFFICIENT_HISTORY` status with null forecast values, retaining observed counts.
+- **Holdout Validation**: Chronological split using the trailing 14 days as holdout. Out-of-sample MAE and WAPE
+  are benchmarked against a trailing weekday mean baseline. The baseline is selected whenever it yields lower MAE
+  or if Poisson regression encounters fitting issues.
+- **Units Forecast**: Derived deterministically as `forecast_invoice_count * (observed_units / observed_invoice_count)`.
+- **Annual Validation Flag**: Kept `false` in the frozen wire contract because a 14-day holdout does not validate
+  multi-year annual seasonality without rolling multi-year backtests. Available annual history cycles are reported
+  for reference in explanations and annotated in warnings.
+- **Demand Caveat**: Warnings always include the explicit caveat that forecasts represent observed sales
+  frequency rather than unconstrained true demand due to potential unobserved stockout bias.
+- **Concurrency & Off-Loop Execution**: Regression training runs in worker threads (`asyncio.to_thread`) bounded
+  by concurrency semaphore limited to 2 max.
+
+### Customer Advisor Context
+
+Existing `/suggest` customer endpoint automatically receives server-derived current Asia/Ho_Chi_Minh calendar
+context (current date, season, active holiday peak) within its system prompt, preserving full backward
+compatibility with all existing kiosk contracts and test suites.
+
+### CLI Tools
+
+Located in `tools/seasonal_cli.py`:
+- `python tools/seasonal_cli.py aggregate --input sales.csv --output-json payload.json --target-year 2026 --target-month 3 --data-source DATABASE`:
+  Reads raw sales transactions (order_id, product_id, date, quantity), handles UTF-8 / BOM encoding and duplicates,
+  groups distinct invoice counts per day/product, and generates validated `seasonal-v1` request payloads.
+  Requires explicit `--data-source` (`DATABASE` or `SYNTHETIC`) to prevent assuming provenance for arbitrary CSVs.
+- `python tools/seasonal_cli.py demo --output-json demo.json --output-csv demo.csv --target-year 2026 --target-month 3`:
+  Generates a deterministic 2-year synthetic dataset explicitly labeled `SYNTHETIC` demonstrating seasonal spikes, steady baselines,
+  cold start products, and sparse observation archetypes.

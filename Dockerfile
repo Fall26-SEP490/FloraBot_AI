@@ -3,13 +3,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py seasonal.py ./
+COPY tools tools
 
 FROM base AS test
 COPY requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY tests tests
-RUN ruff check app.py tests && ruff format --check app.py tests && python -m pytest -q
+RUN ruff check app.py seasonal.py tools tests && ruff format --check app.py seasonal.py tools tests && python -m pytest -q
 
 FROM base AS runtime
 RUN useradd --uid 10001 --create-home advisor
