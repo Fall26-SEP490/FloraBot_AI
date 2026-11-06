@@ -12,6 +12,17 @@ that final .NET/SQL boundary.
 - `GEMINI_MODEL`: explicit stable model ID enabled for your project. No default,
   `latest`, `preview`, experimental aliases or caller-selected model is accepted.
 
+The selected VPS model is `gemini-3.5-flash-lite`. Set `GEMINI_MODEL` to this exact
+value on both the Python service and backend so the advisor cache uses the same
+model identity. This is deployment configuration; the service still requires an
+explicit model and does not rotate models automatically when quota is exhausted.
+
+For native Windows deployment, install `requirements.txt` in a private Python
+3.12 virtual environment and bind Uvicorn to `127.0.0.1:8000`. The Windows-only
+`tzdata` dependency supplies IANA zones such as `Asia/Ho_Chi_Minh`; Windows does not
+normally provide that database. Keep the shared service token and provider key
+outside the repository and configure them privately before starting the service.
+
 The application startup script generates and retains the internal token in ignored
 local storage. Supply provider configuration in BE/.env. No real provider call has
 been verified without credentials. `/health` reports process liveness only;
